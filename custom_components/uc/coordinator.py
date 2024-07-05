@@ -18,30 +18,61 @@ _LOGGER = logging.getLogger(__name__)
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "uc/info",
+        vol.Required("type"): "uc",
+        vol.Required("kind"): "req",
+        vol.Required("msg"): "get_driver_version",
     }
 )
 @callback
-def ws_info(
+def ws_driver_version(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Handle get driver version command."""
+    _LOGGER.debug("Unfolded Circle driver version request %s", msg)
+    connection.send_message({
+        "kind": "resp",
+        "req_id": msg["id"],
+        "code": 200,
+        "msg": "driver_version",
+        "msg_data": {
+            "name": "Home Assistant driver",
+            "version": {
+                "api": "0.20.0",
+                "driver": "1.0.0"
+            }
+        }
+    })
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "uc",
+        vol.Required("kind"): "event",
+        vol.Required("msg"): "connect",
+    }
+)
+@callback
+def ws_connect(
         hass: HomeAssistant,
         connection: websocket_api.ActiveConnection,
         msg: dict,
 ) -> None:
     """Handle get info command."""
-    if hass.data[DOMAIN] is None:
-        _LOGGER.error("Unfolded Circle integration not configured")
-        return
 
-    coordinator: UCCoordinator = (next(iter(hass.data[DOMAIN].values()))).get(COORDINATOR_ENTRY, None)
-    if coordinator is None:
-        _LOGGER.error("Unfolded Circle coordinator not initialized")
-
-    connection.send_result(
-        msg["id"],
-        {
-            "config": hass.config.as_dict()
-        },
-    )
+    _LOGGER.debug("Unfolded Circle connect request %s", msg)
+    connection.send_message({
+        "kind": "resp",
+        "req_id": msg["id"],
+        "code": 200,
+        "msg": "device_state",
+        "msg_data": {
+            "state": "CONNECTED",
+            "cat": "DEVICE"
+        }
+    })
 
 
 @websocket_api.require_admin
@@ -97,7 +128,8 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.data = {}
         self._jobs = []
 
-        websocket_api.async_register_command(hass, ws_info)
+        websocket_api.async_register_command(hass, ws_driver_version)
+        websocket_api.async_register_command(hass, ws_connect)
         websocket_api.async_register_command(hass, ws_subscribe_event)
         _LOGGER.debug("Unfolded Circle websocket APIs registered")
 
