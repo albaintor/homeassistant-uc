@@ -1,0 +1,14 @@
+{
+  "domain": "uc",
+  "name": "Unfolded Circle integration for remote control",
+    "codeowners": [
+    "@albaintor"
+  ],
+  "documentation": "https://github.com/unfoldedcircle/ha-component",
+  "config_flow": true,
+  "homekit": {},
+  "issue_tracker": "https://github.com/unfoldedcircle/ha-component/issues",
+  "ssdp": [],
+  "version": "1.0.0",
+  "zeroconf": []
+}
