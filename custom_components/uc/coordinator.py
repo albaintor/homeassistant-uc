@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
+
 import voluptuous as vol
 from typing import Any, Callable
 
 from homeassistant.components import websocket_api
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, callback, Event
+from homeassistant.helpers.event import async_track_state_change_event, EventStateChangedData
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, COORDINATOR_ENTRY
@@ -15,43 +18,18 @@ from .const import DOMAIN, COORDINATOR_ENTRY
 _LOGGER = logging.getLogger(__name__)
 
 
-@websocket_api.require_admin
-@websocket_api.websocket_command(
-    {
-        vol.Required("type"): "uc",
-        vol.Required("kind"): "req",
-        vol.Required("msg"): "get_driver_version",
-    }
-)
-@callback
-def ws_driver_version(
-        hass: HomeAssistant,
-        connection: websocket_api.ActiveConnection,
-        msg: dict,
-) -> None:
-    """Handle get driver version command."""
-    _LOGGER.debug("Unfolded Circle driver version request %s", msg)
-    connection.send_message({
-        "kind": "resp",
-        "req_id": msg["id"],
-        "code": 200,
-        "msg": "driver_version",
-        "msg_data": {
-            "name": "Home Assistant driver",
-            "version": {
-                "api": "0.20.0",
-                "driver": "1.0.0"
-            }
-        }
-    })
+@dataclass
+class SubscriptionEvent:
+    remote_id: str
+    cancel_subscription: ()
+    action: Callable[[dict[any, any]], None]
+    entities: [str]
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "uc",
-        vol.Required("kind"): "event",
-        vol.Required("msg"): "connect",
+        vol.Required("type"): "uc/info"
     }
 )
 @callback
@@ -64,13 +42,13 @@ def ws_connect(
 
     _LOGGER.debug("Unfolded Circle connect request %s", msg)
     connection.send_message({
-        "kind": "resp",
-        "req_id": msg["id"],
-        "code": 200,
-        "msg": "device_state",
-        "msg_data": {
+        "id": msg["id"],
+        "type": "result",
+        "success": True,
+        "result": {
             "state": "CONNECTED",
-            "cat": "DEVICE"
+            "cat": "DEVICE",
+            "version": "1.0.0"
         }
     })
 
@@ -78,7 +56,38 @@ def ws_connect(
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "uc/subscribe_entities",
+        vol.Required("type"): "uc/event/unsubscribe",
+    }
+)
+@callback
+def ws_unsubscribe_event(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Subscribe to incoming and outgoing events."""
+    if hass.data[DOMAIN] is None:
+        _LOGGER.error("Unfolded Circle integration not configured")
+        connection.send_result(msg["id"])
+        return
+
+    coordinator: UCCoordinator = (next(iter(hass.data[DOMAIN].values()))).get(COORDINATOR_ENTRY, None)
+    if coordinator is None:
+        _LOGGER.error("Unfolded Circle coordinator not initialized")
+        connection.send_result(msg["id"])
+        return
+
+    cancel_callback = connection.subscriptions.get(msg["id"], None)
+    if cancel_callback is not None:
+        cancel_callback()
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "uc/event/subscribed_entities",
+        vol.Optional("data"): dict[any, any]
     }
 )
 @callback
@@ -104,9 +113,9 @@ def ws_subscribe_event(
             data,
         )
 
-    connection.subscriptions[msg["id"]] = coordinator.listen_event(
+    connection.subscriptions[msg["id"]] = coordinator.subscribed_entities(
         action=forward_event,
-        name="Entity update",
+        data=msg["data"]
     )
     connection.send_result(msg["id"])
 
@@ -126,11 +135,11 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass = hass
         self._entities = subscribed_entities
         self.data = {}
-        self._jobs = []
+        self._jobs: list[SubscriptionEvent] = []
 
-        websocket_api.async_register_command(hass, ws_driver_version)
         websocket_api.async_register_command(hass, ws_connect)
         websocket_api.async_register_command(hass, ws_subscribe_event)
+        websocket_api.async_register_command(hass, ws_unsubscribe_event)
         _LOGGER.debug("Unfolded Circle websocket APIs registered")
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -145,27 +154,52 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Error communicating with Unfolded Circle API {ex}"
             ) from ex
 
-    def listen_event(self, action: Callable[[dict[any, any]], None], name: str) -> Callable:
+    def entities_state_change_event(self, event: Event[EventStateChangedData]) -> Any:
+        entity_id = event.data["entity_id"]
+        old_state = event.data["old_state"]
+        new_state = event.data["new_state"]
+        _LOGGER.debug("Received notification to send to UC remote %s", event)
+        for job in self._jobs:
+            if entity_id in job.entities:
+                job.action({"type": "event", "event": {
+                    "data": {
+                        "entity_id": entity_id,
+                        "new_state": new_state,
+                        "old_state": old_state #TODO : old state useful ?
+                    }
+                }})
+
+
+
+    def subscribed_entities(self, action: Callable[[dict[any, any]], None], data: dict[any, any]) -> Callable:
         """Adds and handle subscribed event"""
-        task = asyncio.create_task(self.test_action_event(action, name))
-        self._jobs.append(task)
+        entities = data.get("entities", [])
+        #TODO handle remote instance to be able to handle subscriptions per device: self._jobs should be hashmap
+        #TODO 2 : if multiple remotes subscribe to the same entity ids, we will have multiple jobs that will
+        # receive the same notifications to send to the remote so the remote will receive them multiple times
+        # => regroup all jobs into one and manage the full (unique) list of entities whatever the remote is
+        # and send the notif to the right remote(s)
+        task = async_track_state_change_event(self.hass, entities, self.entities_state_change_event)
+        job: SubscriptionEvent = SubscriptionEvent(cancel_subscription=task, remote_id="",
+                                                   action=action, entities=entities)
+        self._jobs.append(job)
 
         def remove_listener() -> None:
             """Remove the listener."""
             try:
                 _LOGGER.debug("Unfolded Circle unregister event")
-                task.cancel()
+                task()
             except Exception:
                 pass
-            self._jobs.remove(task)
+            self._jobs.remove(job)
 
         return remove_listener
 
-    async def test_action_event(self, action: Callable[[dict[any, any]], None], name: str):
+    async def test_action_event(self, action: Callable[[dict[any, any]], None], entities: list[str]):
         while True:
             await asyncio.sleep(10)
             _LOGGER.debug("Unfolded Circle send event")
-            action({"test": "test data", "event": name})
+            action({"test": "send entities event", "event": entities})
 
     def update(self) -> dict[str, any]:
         """Update the internal state by querying the device."""
