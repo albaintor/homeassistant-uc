@@ -161,13 +161,13 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug("Received notification to send to UC remote %s", event)
         for job in self._jobs:
             if entity_id in job.entities:
-                job.action({"type": "event", "event": {
+                job.action({
                     "data": {
                         "entity_id": entity_id,
                         "new_state": new_state,
                         "old_state": old_state #TODO : old state useful ?
                     }
-                }})
+                })
 
 
 
