@@ -20,10 +20,11 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class SubscriptionEvent:
-    remote_id: str
-    cancel_subscription: ()
-    action: Callable[[dict[any, any]], None]
-    entities: [str]
+    client_id: str
+    subscription_id: int
+    cancel_subscription_callback: ()
+    notification_callback: Callable[[dict[any, any]], None]
+    entity_ids: [str]
 
 
 @websocket_api.require_admin
@@ -33,7 +34,7 @@ class SubscriptionEvent:
     }
 )
 @callback
-def ws_connect(
+def ws_get_info(
         hass: HomeAssistant,
         connection: websocket_api.ActiveConnection,
         msg: dict,
@@ -105,18 +106,7 @@ def ws_subscribe_event(
     if coordinator is None:
         _LOGGER.error("Unfolded Circle coordinator not initialized")
 
-    @callback
-    def forward_event(data: dict[any, any]) -> None:
-        """Forward telegram to websocket subscription."""
-        connection.send_event(
-            msg["id"],
-            data,
-        )
-
-    connection.subscriptions[msg["id"]] = coordinator.subscribed_entities(
-        action=forward_event,
-        data=msg["data"]
-    )
+    coordinator.subscribe_entities_events(connection, msg)
     connection.send_result(msg["id"])
 
 
@@ -135,9 +125,9 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass = hass
         self._entities = subscribed_entities
         self.data = {}
-        self._jobs: list[SubscriptionEvent] = []
+        self._subscriptions: list[SubscriptionEvent] = []
 
-        websocket_api.async_register_command(hass, ws_connect)
+        websocket_api.async_register_command(hass, ws_get_info)
         websocket_api.async_register_command(hass, ws_subscribe_event)
         websocket_api.async_register_command(hass, ws_unsubscribe_event)
         _LOGGER.debug("Unfolded Circle websocket APIs registered")
@@ -154,52 +144,64 @@ class UCCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Error communicating with Unfolded Circle API {ex}"
             ) from ex
 
-    def entities_state_change_event(self, event: Event[EventStateChangedData]) -> Any:
-        entity_id = event.data["entity_id"]
-        old_state = event.data["old_state"]
-        new_state = event.data["new_state"]
-        _LOGGER.debug("Received notification to send to UC remote %s", event)
-        for job in self._jobs:
-            if entity_id in job.entities:
-                job.action({
-                    "data": {
-                        "entity_id": entity_id,
-                        "new_state": new_state,
-                        "old_state": old_state #TODO : old state useful ?
-                    }
-                })
-
-
-
-    def subscribed_entities(self, action: Callable[[dict[any, any]], None], data: dict[any, any]) -> Callable:
+    def subscribe_entities_events(self, connection: websocket_api.ActiveConnection,
+                                  msg: dict):
         """Adds and handle subscribed event"""
-        entities = data.get("entities", [])
-        #TODO handle remote instance to be able to handle subscriptions per device: self._jobs should be hashmap
-        #TODO 2 : if multiple remotes subscribe to the same entity ids, we will have multiple jobs that will
-        # receive the same notifications to send to the remote so the remote will receive them multiple times
-        # => regroup all jobs into one and manage the full (unique) list of entities whatever the remote is
-        # and send the notif to the right remote(s)
-        task = async_track_state_change_event(self.hass, entities, self.entities_state_change_event)
-        job: SubscriptionEvent = SubscriptionEvent(cancel_subscription=task, remote_id="",
-                                                   action=action, entities=entities)
-        self._jobs.append(job)
+        subscription: SubscriptionEvent | None = None
+        cancel_callback: Callable[[], None] | None = None
+
+        @callback
+        def forward_event(data: dict[any, any]) -> None:
+            """Forward telegram to websocket subscription."""
+            connection.send_event(
+                msg["id"],
+                data,
+            )
+
+        def entities_state_change_event(event: Event[EventStateChangedData]) -> Any:
+            """Method called by HA when one of the subscribed entities have changed state."""
+            # Note that this method as to be encapsulated in the subscribe_entities_events method in order to keep
+            # a trace of the subscription variable because no context can be passed to the subscription registry
+            entity_id = event.data["entity_id"]
+            old_state = event.data["old_state"]
+            new_state = event.data["new_state"]
+            _LOGGER.debug("Received notification to send to UC remote %s", event)
+            subscription.notification_callback({
+                "data": {
+                    "entity_id": entity_id,
+                    "new_state": new_state,
+                    "old_state": old_state  # TODO : old state useful ?
+                }
+            })
 
         def remove_listener() -> None:
             """Remove the listener."""
             try:
-                _LOGGER.debug("Unfolded Circle unregister event")
-                task()
+                _LOGGER.debug("Unfolded Circle unregister event %s for remote %s",
+                              subscription_id, client_id)
+                cancel_callback()
             except Exception:
                 pass
-            self._jobs.remove(job)
+            self._subscriptions.remove(subscription)
+
+        # Create the new events subscription
+        subscription_id = msg["id"]
+        data = msg["data"]
+        entities = data.get("entities", [])
+        client_id = data.get("client_id", "")
+
+        cancel_callback = async_track_state_change_event(self.hass, entities, entities_state_change_event)
+        subscription = SubscriptionEvent(client_id=client_id,
+                                         cancel_subscription_callback=cancel_callback,
+                                         subscription_id=subscription_id,
+                                         notification_callback=forward_event,
+                                         entity_ids=entities)
+        self._subscriptions.append(subscription)
+        _LOGGER.debug("UC added subscription from remote %s for entity ids %s", client_id, entities)
+
+        connection.subscriptions[subscription_id] = remove_listener
 
         return remove_listener
-
-    async def test_action_event(self, action: Callable[[dict[any, any]], None], entities: list[str]):
-        while True:
-            await asyncio.sleep(10)
-            _LOGGER.debug("Unfolded Circle send event")
-            action({"test": "send entities event", "event": entities})
 
     def update(self) -> dict[str, any]:
         """Update the internal state by querying the device."""
